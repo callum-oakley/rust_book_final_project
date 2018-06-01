@@ -11,11 +11,14 @@ impl<F: FnOnce()> FnBox for F {
     }
 }
 
-type Job = Box<FnBox + Send + 'static>;
+enum Message {
+    Job(Box<FnBox + Send + 'static>),
+    Terminate,
+}
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    tx: mpsc::Sender<Job>,
+    tx: mpsc::Sender<Message>,
 }
 
 impl ThreadPool {
@@ -46,26 +49,63 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.tx.send(Box::new(f)).unwrap();
+        self.tx.send(Message::Job(Box::new(f))).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        println!("Shutting down ThreadPool...");
+
+        // Send a termination message for each worker. Since each worker exits
+        // after receiving one termination message, this guarantees each worker
+        // gets a message.
+        for _ in &self.workers {
+            self.tx.send(Message::Terminate).unwrap();
+        }
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+
+        println!("All workers stopped.");
     }
 }
 
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    fn new(id: usize, rx: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new(id: usize, rx: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
         Worker {
             id,
-            thread: thread::spawn(move || loop {
-                let job = rx.lock().unwrap().recv().unwrap();
+            thread: Some(thread::spawn(move || loop {
+                // match rx.lock().unwrap().recv().unwrap() { ... } doesn't work
+                // because the lock is in scope for the whole block and so isn't
+                // released until after the job is completed. The threads give
+                // us nothing! So we've got to make sure we release the lock in
+                // an outer scope.
+                let message = rx.lock().unwrap().recv().unwrap();
 
-                println!("Worker {} got a job; executing.", id);
+                match message {
+                    Message::Job(job) => {
+                        println!("Worker {} got a job; executing.", id);
 
-                job.call_box();
-            }),
+                        job.call_box();
+                    }
+                    Message::Terminate => {
+                        println!("Worker {} was told to terminate.", id);
+
+                        break;
+                    }
+                }
+            })),
         }
     }
 }
